@@ -9,23 +9,25 @@ from discord.ext import commands
 TOKEN = os.getenv("DISCORD_TOKEN")
 REVEAL_CHANNEL_ID = int(os.getenv("REVEAL_CHANNEL_ID", "0"))
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+
 EASTERN = ZoneInfo("America/New_York")
 DATA_FILE = "picks.json"
+MAIN_GUILD_ID = None  # set on_ready from reveal channel's guild
 
-# ---------- tiny file store ----------
+# ---------- tiny JSON store ----------
 def _load_all():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r") as f:
             return json.load(f)
     return {}
 
-def _save_all(data):
+def _save_all(d):
     with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+        json.dump(d, f, indent=2)
 
-def _guild_picks(guild_id):
+def _guild_picks(gid: int):
     data = _load_all()
-    gkey = str(guild_id)
+    gkey = str(gid)
     if gkey not in data:
         data[gkey] = {}
     return data, data[gkey]
@@ -50,74 +52,82 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 def _fmt_time_12h(dt_utc: datetime) -> str:
     local = dt_utc.astimezone(EASTERN)
-    # example: Tue 7:05 PM
     return f"{local.strftime('%a %I:%M %p').lstrip('0')}"
 
-def _announce_channel(guild: discord.Guild):
-    # prefer a channel literally named "general"
-    ch = discord.utils.get(guild.text_channels, name="general")
-    return ch or (guild.system_channel if guild and guild.system_channel else None)
+async def _get_main_guild():
+    global MAIN_GUILD_ID
+    if MAIN_GUILD_ID:
+        g = bot.get_guild(MAIN_GUILD_ID)
+        if g:
+            return g
+    ch = bot.get_channel(REVEAL_CHANNEL_ID) or await bot.fetch_channel(REVEAL_CHANNEL_ID)
+    MAIN_GUILD_ID = ch.guild.id
+    return ch.guild
+
+async def _announce_channel():
+    g = await _get_main_guild()
+    # prefer #general, else system channel, else the reveal channel
+    gen = discord.utils.get(g.text_channels, name="general")
+    if gen:
+        return gen
+    if g.system_channel:
+        return g.system_channel
+    return bot.get_channel(REVEAL_CHANNEL_ID)
 
 @bot.event
 async def on_ready():
-    print(f"✅ Logged in as {bot.user}")
+    g = await _get_main_guild()
+    print(f"✅ Logged in as {bot.user} | Main guild: {g.name} ({g.id})")
 
 @bot.command()
 async def ping(ctx):
     await ctx.send("pong 🏌️")
 
-# ---------- !pick ----------
+# ---------- !pick (DM friendly) ----------
 @bot.command()
 async def pick(ctx, *, golfer: str):
-    if ctx.guild is None:
-        await ctx.send("Please submit your pick in the server, not in DMs.")
-        return
-    data, picks = _guild_picks(ctx.guild.id)
+    # accept from anywhere, prefer DM
+    g = await _get_main_guild()
+    data, picks = _guild_picks(g.id)
+
     now_utc = datetime.now(timezone.utc)
     picks[str(ctx.author.id)] = {
         "name": ctx.author.display_name,
         "pick": golfer.strip(),
-        "ts": now_utc.isoformat(),  # store in UTC
+        "ts": now_utc.isoformat(),
     }
     _save_all(data)
 
-    await ctx.reply(f"✅ Pick saved for **{golfer.strip()}**")
-    # announce in #general if it exists
-    gen = _announce_channel(ctx.guild)
-    if gen and gen.permissions_for(ctx.guild.me).send_messages:
-        await gen.send(f"📝 **{ctx.author.display_name}** just submitted a pick.")
+    await ctx.send(f"✅ Pick saved for **{golfer.strip()}**")
+    ch = await _announce_channel()
+    if ch and ch.permissions_for(ch.guild.me).send_messages:
+        await ch.send(f"📝 **{ctx.author.display_name}** just submitted a pick.")
 
-# ---------- !submits ----------
+# ---------- !submits (DM friendly, times only) ----------
 @bot.command()
 async def submits(ctx):
-    if ctx.guild is None:
-        await ctx.send("Run this in the server.")
-        return
-    _, picks = _guild_picks(ctx.guild.id)
+    g = await _get_main_guild()
+    _, picks = _guild_picks(g.id)
     if not picks:
         await ctx.send("📭 No picks submitted yet.")
         return
     lines = ["**🕒 Pick Submission Times**"]
-    for uid, rec in picks.items():
+    for rec in picks.values():
         ts = datetime.fromisoformat(rec["ts"])
         lines.append(f"- **{rec['name']}** at `{_fmt_time_12h(ts)} ET`")
     await ctx.send("\n".join(lines))
 
-# ---------- !revealnow ----------
+# ---------- !revealnow (DM friendly, owner only) ----------
 @bot.command()
 async def revealnow(ctx):
     if ctx.author.id != OWNER_ID:
         await ctx.send("❌ Not authorized.")
         return
-    if ctx.guild is None:
-        await ctx.send("Run this in the server.")
-        return
-    channel = bot.get_channel(REVEAL_CHANNEL_ID)
-    if channel is None:
-        await ctx.send("❌ Reveal channel not found. Check REVEAL_CHANNEL_ID.")
-        return
 
-    data, picks = _guild_picks(ctx.guild.id)
+    g = await _get_main_guild()
+    channel = bot.get_channel(REVEAL_CHANNEL_ID) or await bot.fetch_channel(REVEAL_CHANNEL_ID)
+    data, picks = _guild_picks(g.id)
+
     if not picks:
         await channel.send("⚠️ No picks were submitted.")
         return
@@ -128,8 +138,8 @@ async def revealnow(ctx):
         lines.append(f"- **{rec['name']}**: {rec['pick']} *(submitted {_fmt_time_12h(ts)} ET)*")
     await channel.send("\n".join(lines))
 
-    # clear after reveal, satisfies “stored until Wednesday 9 PM ET” when you trigger it
-    data[str(ctx.guild.id)] = {}
+    # clear after reveal
+    data[str(g.id)] = {}
     _save_all(data)
     await ctx.send("✅ Revealed and cleared.")
 
