@@ -9,6 +9,10 @@ from discord.ext import commands
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
+# ---- TEMP: use an alternate Discord API base to dodge Cloudflare block
+import os, discord.http
+discord.http.Route.BASE = os.getenv("DISCORD_API_BASE", "https://canary.discord.com/api/v10")
+
 TOKEN = os.getenv("DISCORD_TOKEN")
 REVEAL_CHANNEL_ID = int(os.getenv("REVEAL_CHANNEL_ID", "0"))
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
