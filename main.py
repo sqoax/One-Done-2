@@ -157,6 +157,42 @@ async def on_ready():
 async def ping(ctx):
     await ctx.send("pong 🏌️")
 
+# --- open a worksheet from any spreadsheet (put near your other helpers)
+def _open_ws(sheet_id: str, tab_title: str):
+    google_creds = os.getenv("GOOGLE_CREDS")
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(google_creds), scope)
+    return gspread.authorize(creds).open_by_key(sheet_id).worksheet(tab_title)
+
+# --- !totals (DM-friendly)
+@bot.command()
+async def totals(ctx):
+    try:
+        sid = os.getenv("TOTALS_SHEET_ID") or SHEET_ID  # separate file preferred
+        tab = os.getenv("TOTALS_TAB", "Sheet1")
+        ws = _open_ws(sid, tab)
+
+        hiatt  = ws.acell("O6").value
+        caden  = ws.acell("O7").value
+        bennett= ws.acell("O8").value
+
+        # optional: leader lines if you have them in O2/O3
+        leader = ws.acell("O2").value
+        lead_by = ws.acell("O3").value
+
+        msg = (
+            f"**💰 Current Totals**\n"
+            f"Hiatt — {hiatt}\n"
+            f"Caden — {caden}\n"
+            f"Bennett — {bennett}"
+        )
+        if leader and lead_by:
+            msg += f"\n\n🏆 **{leader}** is up by **{lead_by}**"
+
+        await ctx.send(msg)
+    except Exception as e:
+        await ctx.send(f"❌ Could not read totals. ({e})")
+
 # ---------- !pick (DM friendly) ----------
 @bot.command()
 async def pick(ctx, *, golfer: str):
