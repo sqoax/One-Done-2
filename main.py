@@ -4,7 +4,7 @@ from zoneinfo import ZoneInfo
 from threading import Thread
 from flask import Flask
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks  # <-- added tasks
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -130,10 +130,39 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
+# --- helper that posts and clears (used by scheduler & !revealnow)
+async def _do_auto_reveal():
+    channel = bot.get_channel(REVEAL_CHANNEL_ID) or await bot.fetch_channel(REVEAL_CHANNEL_ID)
+    guild_id = channel.guild.id
+
+    latest = load_latest_picks(guild_id)
+    if not latest:
+        try:
+            await channel.send("⚠️ No picks were submitted.")
+        except discord.Forbidden:
+            pass
+        return False
+
+    lines = ["**📣 This Week’s Picks:**"]
+    for rec in latest.values():
+        ts = datetime.fromisoformat(rec["ts_utc"])
+        lines.append(f"- **{rec['name']}**: {rec['pick']} *(submitted {_fmt_time_12h(ts)} ET)*")
+
+    try:
+        await channel.send("\n".join(lines))
+    except discord.Forbidden:
+        return False
+
+    clear_guild_picks(guild_id)
+    return True
+
 @bot.event
 async def on_ready():
     g = _get_main_guild(bot)
     print(f"✅ Logged in as {bot.user} | Main guild: {g.name} ({g.id})")
+    # start the minute ticker once
+    if not auto_reveal_task.is_running():
+        auto_reveal_task.start()
 
 @bot.command()
 async def ping(ctx):
@@ -212,28 +241,18 @@ async def revealnow(ctx):
     if ctx.author.id != OWNER_ID:
         await ctx.send("❌ Not authorized.")
         return
+    ok = await _do_auto_reveal()
+    await ctx.send("✅ Revealed and cleared." if ok else "⚠️ No picks were submitted.")
 
-    g = _get_main_guild(bot)
-    channel = bot.get_channel(REVEAL_CHANNEL_ID) or await bot.fetch_channel(REVEAL_CHANNEL_ID)
-
-    latest = load_latest_picks(g.id)
-    if not latest:
-        await channel.send("⚠️ No picks were submitted.")
-        return
-
-    lines = ["**📣 This Week’s Picks:**"]
-    for rec in latest.values():
-        ts = datetime.fromisoformat(rec["ts_utc"])
-        lines.append(f"- **{rec['name']}**: {rec['pick']} *(submitted {_fmt_time_12h(ts)} ET)*")
-
-    try:
-        await channel.send("\n".join(lines))
-    except discord.Forbidden:
-        await ctx.send("I cannot send messages in the reveal channel, grant View and Send.")
-        return
-
-    clear_guild_picks(g.id)
-    await ctx.send("✅ Revealed and cleared.")
+# ---------- scheduled auto reveal at Wed 9:00 PM ET ----------
+@tasks.loop(minutes=1)
+async def auto_reveal_task():
+    now = datetime.now(EASTERN)
+    if now.strftime("%A") == "Wednesday" and now.strftime("%H:%M") == "21:00":
+        try:
+            await _do_auto_reveal()
+        except Exception as e:
+            print("Auto reveal failed:", type(e).__name__, e)
 
 if __name__ == "__main__":
     keep_alive()
