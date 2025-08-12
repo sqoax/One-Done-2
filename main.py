@@ -58,6 +58,13 @@ def _sheet():
         ws.update("A1", [_HEADERS])
     return ws
 
+# ---- open a worksheet from any spreadsheet (used by !totals)
+def _open_ws(sheet_id: str, tab_title: str):
+    google_creds = os.getenv("GOOGLE_CREDS")
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(google_creds), scope)
+    return gspread.authorize(creds).open_by_key(sheet_id).worksheet(tab_title)
+
 def _get_main_guild(bot):
     global MAIN_GUILD_ID
     if MAIN_GUILD_ID:
@@ -83,7 +90,7 @@ async def _announce_channel(bot: commands.Bot):
         return g.system_channel
     return bot.get_channel(REVEAL_CHANNEL_ID)
 
-# data access
+# ---------- data access ----------
 def save_pick_to_sheet(guild_id: int, user_id: int, name: str, pick: str, ts_utc_iso: str):
     ws = _sheet()
     ws.append_row([str(guild_id), str(user_id), name, pick, ts_utc_iso], value_input_option="RAW")
@@ -160,6 +167,44 @@ async def submits(ctx):
         ts = datetime.fromisoformat(rec["ts_utc"])
         lines.append(f"- **{rec['name']}** at {_fmt_time_12h(ts)} ET")
     await ctx.send("\n".join(lines))
+
+# ---------- !totals (reads from separate spreadsheet/tab) ----------
+@bot.command()
+async def totals(ctx):
+    """Show totals from a separate spreadsheet/tab."""
+    sid = os.getenv("TOTALS_SHEET_ID") or os.getenv("SHEET_ID")
+    tab = os.getenv("TOTALS_TAB", "Sheet1")
+    try:
+        ws = _open_ws(sid, tab)
+    except gspread.SpreadsheetNotFound:
+        await ctx.send("❌ Can't open totals spreadsheet. Check TOTALS_SHEET_ID and share it with the service account email in GOOGLE_CREDS.")
+        return
+    except gspread.WorksheetNotFound:
+        await ctx.send(f"❌ Can't find tab `{tab}`. Update TOTALS_TAB to the exact tab name.")
+        return
+    except Exception as e:
+        await ctx.send(f"❌ Couldn't open totals sheet: {type(e).__name__}: {e}")
+        return
+
+    try:
+        hiatt   = ws.acell("O6").value
+        caden   = ws.acell("O7").value
+        bennett = ws.acell("O8").value
+        leader  = ws.acell("O2").value
+        lead_by = ws.acell("O3").value
+    except Exception as e:
+        await ctx.send(f"❌ Read failed: {type(e).__name__}: {e}")
+        return
+
+    msg = (
+        f"**💰 Current Totals**\n"
+        f"Hiatt — {hiatt}\n"
+        f"Caden — {caden}\n"
+        f"Bennett — {bennett}"
+    )
+    if leader and lead_by:
+        msg += f"\n\n🏆 **{leader}** is up by **{lead_by}**"
+    await ctx.send(msg)
 
 # ---------- !revealnow (DM friendly, owner only) ----------
 @bot.command()
