@@ -6,31 +6,16 @@ from flask import Flask
 import discord
 from discord.ext import commands
 
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+
 TOKEN = os.getenv("DISCORD_TOKEN")
 REVEAL_CHANNEL_ID = int(os.getenv("REVEAL_CHANNEL_ID", "0"))
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+SHEET_ID = os.getenv("SHEET_ID", "")
 
 EASTERN = ZoneInfo("America/New_York")
-DATA_FILE = "picks.json"
-MAIN_GUILD_ID = None  # set on_ready from reveal channel's guild
-
-# ---------- tiny JSON store ----------
-def _load_all():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
-    return {}
-
-def _save_all(d):
-    with open(DATA_FILE, "w") as f:
-        json.dump(d, f, indent=2)
-
-def _guild_picks(gid: int):
-    data = _load_all()
-    gkey = str(gid)
-    if gkey not in data:
-        data[gkey] = {}
-    return data, data[gkey]
+MAIN_GUILD_ID = None  # set at startup
 
 # ---------- Flask keep-alive ----------
 app = Flask(__name__)
@@ -45,28 +30,48 @@ def run():
 def keep_alive():
     Thread(target=run, daemon=True).start()
 
-# ---------- Discord ----------
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+# ---------- Google Sheets helpers ----------
+_HEADERS = ["guild_id", "user_id", "name", "pick", "ts_utc"]
 
-def _fmt_time_12h(dt_utc: datetime) -> str:
-    local = dt_utc.astimezone(EASTERN)
-    return f"{local.strftime('%a %I:%M %p').lstrip('0')}"
+def _sheet():
+    google_creds = os.getenv("GOOGLE_CREDS")
+    if not google_creds or not SHEET_ID:
+        raise RuntimeError("Set GOOGLE_CREDS and SHEET_ID env vars in Render.")
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(google_creds), scope)
+    client = gspread.authorize(creds)
+    sh = client.open_by_key(SHEET_ID)
+    try:
+        ws = sh.worksheet("Picks")
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title="Picks", rows=1000, cols=len(_HEADERS))
+    # ensure header row
+    existing = ws.row_values(1)
+    if existing != _HEADERS:
+        ws.update("A1", [_HEADERS])
+    return ws
 
-async def _get_main_guild():
+def _get_main_guild(bot):
     global MAIN_GUILD_ID
     if MAIN_GUILD_ID:
         g = bot.get_guild(MAIN_GUILD_ID)
         if g:
             return g
-    ch = bot.get_channel(REVEAL_CHANNEL_ID) or await bot.fetch_channel(REVEAL_CHANNEL_ID)
+    ch = bot.get_channel(REVEAL_CHANNEL_ID)
+    if ch is None:
+        ch = bot.loop.run_until_complete(bot.fetch_channel(REVEAL_CHANNEL_ID))
     MAIN_GUILD_ID = ch.guild.id
     return ch.guild
 
-async def _announce_channel():
-    g = await _get_main_guild()
-    # prefer #general, else system channel, else the reveal channel
+def _fmt_time_12h(dt_utc: datetime) -> str:
+    local = dt_utc.astimezone(EASTERN)
+    return f"{local.strftime('%a %I:%M %p').lstrip('0')}"
+
+async def _announce_channel(bot: commands.Bot):
+    g = _get_main_guild(bot)
     gen = discord.utils.get(g.text_channels, name="general")
     if gen:
         return gen
@@ -74,9 +79,49 @@ async def _announce_channel():
         return g.system_channel
     return bot.get_channel(REVEAL_CHANNEL_ID)
 
+# data access
+def save_pick_to_sheet(guild_id: int, user_id: int, name: str, pick: str, ts_utc_iso: str):
+    ws = _sheet()
+    ws.append_row([str(guild_id), str(user_id), name, pick, ts_utc_iso], value_input_option="RAW")
+
+def load_latest_picks(guild_id: int):
+    """Return dict keyed by user_id with latest pick only."""
+    ws = _sheet()
+    records = ws.get_all_records()  # list of dicts, skips header
+    latest = {}
+    for r in records:
+        if str(r.get("guild_id")) != str(guild_id):
+            continue
+        uid = str(r.get("user_id"))
+        ts = r.get("ts_utc") or ""
+        # keep the newest
+        if uid not in latest or ts > latest[uid]["ts_utc"]:
+            latest[uid] = {
+                "name": r.get("name", ""),
+                "pick": r.get("pick", ""),
+                "ts_utc": ts,
+            }
+    return latest
+
+def clear_guild_picks(guild_id: int):
+    ws = _sheet()
+    values = ws.get_all_values()
+    if not values:
+        ws.update("A1", [_HEADERS])
+        return
+    header, rows = values[0], values[1:]
+    keep = [row for row in rows if row and row[0] != str(guild_id)]
+    ws.clear()
+    ws.update("A1", [header] + keep if keep else [header])
+
+# ---------- Discord ----------
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+
 @bot.event
 async def on_ready():
-    g = await _get_main_guild()
+    g = _get_main_guild(bot)
     print(f"✅ Logged in as {bot.user} | Main guild: {g.name} ({g.id})")
 
 @bot.command()
@@ -86,34 +131,29 @@ async def ping(ctx):
 # ---------- !pick (DM friendly) ----------
 @bot.command()
 async def pick(ctx, *, golfer: str):
-    # accept from anywhere, prefer DM
-    g = await _get_main_guild()
-    data, picks = _guild_picks(g.id)
-
+    g = _get_main_guild(bot)
     now_utc = datetime.now(timezone.utc)
-    picks[str(ctx.author.id)] = {
-        "name": ctx.author.display_name,
-        "pick": golfer.strip(),
-        "ts": now_utc.isoformat(),
-    }
-    _save_all(data)
-
+    save_pick_to_sheet(g.id, ctx.author.id, ctx.author.display_name, golfer.strip(), now_utc.isoformat())
     await ctx.send(f"✅ Pick saved for **{golfer.strip()}**")
-    ch = await _announce_channel()
+
+    ch = await _announce_channel(bot)
     if ch and ch.permissions_for(ch.guild.me).send_messages:
-        await ch.send(f"📝 **{ctx.author.display_name}** just submitted a pick.")
+        try:
+            await ch.send(f"📝 **{ctx.author.display_name}** just submitted a pick.")
+        except discord.Forbidden:
+            pass
 
 # ---------- !submits (DM friendly, times only) ----------
 @bot.command()
 async def submits(ctx):
-    g = await _get_main_guild()
-    _, picks = _guild_picks(g.id)
-    if not picks:
+    g = _get_main_guild(bot)
+    latest = load_latest_picks(g.id)
+    if not latest:
         await ctx.send("📭 No picks submitted yet.")
         return
     lines = ["**🕒 Pick Submission Times**"]
-    for rec in picks.values():
-        ts = datetime.fromisoformat(rec["ts"])
+    for rec in latest.values():
+        ts = datetime.fromisoformat(rec["ts_utc"])
         lines.append(f"- **{rec['name']}** at `{_fmt_time_12h(ts)} ET`")
     await ctx.send("\n".join(lines))
 
@@ -124,23 +164,26 @@ async def revealnow(ctx):
         await ctx.send("❌ Not authorized.")
         return
 
-    g = await _get_main_guild()
+    g = _get_main_guild(bot)
     channel = bot.get_channel(REVEAL_CHANNEL_ID) or await bot.fetch_channel(REVEAL_CHANNEL_ID)
-    data, picks = _guild_picks(g.id)
 
-    if not picks:
+    latest = load_latest_picks(g.id)
+    if not latest:
         await channel.send("⚠️ No picks were submitted.")
         return
 
     lines = ["**📣 This Week’s Picks:**"]
-    for rec in picks.values():
-        ts = datetime.fromisoformat(rec["ts"])
+    for rec in latest.values():
+        ts = datetime.fromisoformat(rec["ts_utc"])
         lines.append(f"- **{rec['name']}**: {rec['pick']} *(submitted {_fmt_time_12h(ts)} ET)*")
-    await channel.send("\n".join(lines))
 
-    # clear after reveal
-    data[str(g.id)] = {}
-    _save_all(data)
+    try:
+        await channel.send("\n".join(lines))
+    except discord.Forbidden:
+        await ctx.send("I cannot send messages in the reveal channel, grant View and Send.")
+        return
+
+    clear_guild_picks(g.id)
     await ctx.send("✅ Revealed and cleared.")
 
 if __name__ == "__main__":
