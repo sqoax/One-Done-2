@@ -4,7 +4,7 @@ from zoneinfo import ZoneInfo
 from threading import Thread
 from flask import Flask
 import discord
-from discord.ext import commands, tasks  # <-- added tasks
+from discord.ext import commands, tasks
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -160,7 +160,6 @@ async def _do_auto_reveal():
 async def on_ready():
     g = _get_main_guild(bot)
     print(f"✅ Logged in as {bot.user} | Main guild: {g.name} ({g.id})")
-    # start the minute ticker once
     if not auto_reveal_task.is_running():
         auto_reveal_task.start()
 
@@ -168,14 +167,12 @@ async def on_ready():
 async def ping(ctx):
     await ctx.send("pong 🏌️")
 
-# ---------- !pick (DM friendly) ----------
 @bot.command()
 async def pick(ctx, *, golfer: str):
     g = _get_main_guild(bot)
     now_utc = datetime.now(timezone.utc)
     save_pick_to_sheet(g.id, ctx.author.id, ctx.author.display_name, golfer.strip(), now_utc.isoformat())
     await ctx.send(f"✅ Pick saved for **{golfer.strip()}**")
-
     ch = await _announce_channel(bot)
     if ch and ch.permissions_for(ch.guild.me).send_messages:
         try:
@@ -183,7 +180,6 @@ async def pick(ctx, *, golfer: str):
         except discord.Forbidden:
             pass
 
-# ---------- !submits (DM friendly, times only) ----------
 @bot.command()
 async def submits(ctx):
     g = _get_main_guild(bot)
@@ -197,34 +193,23 @@ async def submits(ctx):
         lines.append(f"- **{rec['name']}** at {_fmt_time_12h(ts)} ET")
     await ctx.send("\n".join(lines))
 
-# ---------- !totals (reads from separate spreadsheet/tab) ----------
 @bot.command()
 async def totals(ctx):
-    """Show totals from a separate spreadsheet/tab."""
     sid = os.getenv("TOTALS_SHEET_ID") or os.getenv("SHEET_ID")
     tab = os.getenv("TOTALS_TAB", "Sheet1")
     try:
         ws = _open_ws(sid, tab)
     except gspread.SpreadsheetNotFound:
-        await ctx.send("❌ Can't open totals spreadsheet. Check TOTALS_SHEET_ID and share it with the service account email in GOOGLE_CREDS.")
+        await ctx.send("❌ Can't open totals spreadsheet.")
         return
     except gspread.WorksheetNotFound:
-        await ctx.send(f"❌ Can't find tab `{tab}`. Update TOTALS_TAB to the exact tab name.")
+        await ctx.send(f"❌ Can't find tab `{tab}`.")
         return
-    except Exception as e:
-        await ctx.send(f"❌ Couldn't open totals sheet: {type(e).__name__}: {e}")
-        return
-
-    try:
-        hiatt   = ws.acell("O6").value
-        caden   = ws.acell("O7").value
-        bennett = ws.acell("O8").value
-        leader  = ws.acell("O2").value
-        lead_by = ws.acell("O3").value
-    except Exception as e:
-        await ctx.send(f"❌ Read failed: {type(e).__name__}: {e}")
-        return
-
+    hiatt   = ws.acell("O6").value
+    caden   = ws.acell("O7").value
+    bennett = ws.acell("O8").value
+    leader  = ws.acell("O2").value
+    lead_by = ws.acell("O3").value
     msg = (
         f"**💰 Current Totals**\n"
         f"Hiatt — {hiatt}\n"
@@ -235,7 +220,6 @@ async def totals(ctx):
         msg += f"\n\n🏆 **{leader}** is up by **{lead_by}**"
     await ctx.send(msg)
 
-# ---------- !revealnow (DM friendly, owner only) ----------
 @bot.command()
 async def revealnow(ctx):
     if ctx.author.id != OWNER_ID:
@@ -244,7 +228,6 @@ async def revealnow(ctx):
     ok = await _do_auto_reveal()
     await ctx.send("✅ Revealed and cleared." if ok else "⚠️ No picks were submitted.")
 
-# ---------- scheduled auto reveal at Wed 9:00 PM ET ----------
 @tasks.loop(minutes=1)
 async def auto_reveal_task():
     now = datetime.now(EASTERN)
@@ -253,6 +236,73 @@ async def auto_reveal_task():
             await _do_auto_reveal()
         except Exception as e:
             print("Auto reveal failed:", type(e).__name__, e)
+
+# ---------- !allocate command ----------
+import re
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
+
+def frac_to_decimal(frac_str: str) -> Decimal:
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)\s*", frac_str)
+    if not m:
+        raise ValueError(f"Bad fractional odds: {frac_str}")
+    num = Decimal(m.group(1))
+    den = Decimal(m.group(2))
+    if den == 0:
+        raise ValueError("Denominator cannot be zero")
+    return (num / den) + Decimal("1")
+
+def parse_header(line: str):
+    m = re.search(r"!allocate\s+(\d+(?:\.\d+)?)\s*u\b\s+\$?\s*(\d+(?:\.\d+)?)", line, re.IGNORECASE)
+    if not m:
+        raise ValueError("Header must look like: !allocate 1u $10")
+    units = Decimal(m.group(1))
+    unit_value = Decimal(m.group(2))
+    return units, unit_value
+
+def parse_lines(lines):
+    picks = []
+    for ln in lines:
+        if not ln.strip():
+            continue
+        m = re.search(r"(.*\S)\s+(\d+(?:\.\d+)?/\d+(?:\.\d+)?)\s*$", ln.strip())
+        if not m:
+            raise ValueError(f"Could not parse line: {ln}")
+        name = m.group(1).strip()
+        frac = m.group(2).strip()
+        dec_odds = frac_to_decimal(frac)
+        picks.append((name, frac, dec_odds))
+    return picks
+
+def equal_payout_stakes(total_stake: Decimal, dec_odds_list):
+    inv_sum = sum((Decimal("1") / o for o in dec_odds_list), start=Decimal("0"))
+    W = (total_stake / inv_sum)
+    raw = [W / o for o in dec_odds_list]
+    rounded = [r.quantize(Decimal("0.01"), rounding=ROUND_DOWN) for r in raw]
+    diff = total_stake - sum(rounded)
+    residuals = [(i, raw[i] - rounded[i]) for i in range(len(raw))]
+    residuals.sort(key=lambda t: t[1], reverse=True)
+    cents = int((diff * 100).to_integral_value(rounding=ROUND_HALF_UP))
+    for i in range(cents):
+        idx = residuals[i % len(raw)][0]
+        rounded[idx] += Decimal("0.01")
+    return W, rounded
+
+@bot.command()
+async def allocate(ctx):
+    try:
+        lines = ctx.message.content.splitlines()
+        units, unit_value = parse_header(lines[0])
+        picks = parse_lines(lines[1:])
+        total_stake = (units * unit_value).quantize(Decimal("0.01"))
+        decs = [p[2] for p in picks]
+        W, stakes = equal_payout_stakes(total_stake, decs)
+        units_each = [(s / unit_value).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) for s in stakes]
+        table = ["Player | Odds | Units | Dollars", "------ | ---- | ----- | -------"]
+        for (name, frac, _), s, u in zip(picks, stakes, units_each):
+            table.append(f"{name} | {frac} | {u}u | ${s}")
+        await ctx.reply(f"**Equal payout ≈ ${W.quantize(Decimal('0.01'))}**\n```text\n" + "\n".join(table) + "\n```")
+    except Exception as e:
+        await ctx.reply(f"Error: {e}")
 
 if __name__ == "__main__":
     keep_alive()
