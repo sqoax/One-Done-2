@@ -1,10 +1,13 @@
-import os, json
+import os, json, re
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from threading import Thread
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
+
 from flask import Flask
 import discord
 from discord.ext import commands, tasks
+from discord.ext.commands import cooldown, BucketType
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -13,13 +16,23 @@ from oauth2client.service_account import ServiceAccountCredentials
 import os, discord.http
 discord.http.Route.BASE = os.getenv("DISCORD_API_BASE", "https://canary.discord.com/api/v10")
 
-TOKEN = os.getenv("DISCORD_TOKEN")
+# ---------- Env & constants ----------
+def _require_env(key: str) -> str:
+    val = os.getenv(key)
+    if not val:
+        raise RuntimeError(f"Missing required env var: {key}")
+    return val
+
+TOKEN = _require_env("DISCORD_TOKEN")
 REVEAL_CHANNEL_ID = int(os.getenv("REVEAL_CHANNEL_ID", "0"))
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-SHEET_ID = os.getenv("SHEET_ID", "")
+SHEET_ID = _require_env("SHEET_ID")
 
 EASTERN = ZoneInfo("America/New_York")
-MAIN_GUILD_ID = None  # set at startup
+MAIN_GUILD_ID = None  # set at runtime
+
+# --- uptime tracking ---
+START_TIME_UTC = datetime.now(timezone.utc)
 
 # ---------- Flask keep-alive ----------
 app = Flask(__name__)
@@ -37,43 +50,55 @@ def keep_alive():
 # ---------- Google Sheets helpers ----------
 _HEADERS = ["guild_id", "user_id", "name", "pick", "ts_utc"]
 
-def _sheet():
+# cache the client and the "Picks" worksheet to cut latency & quota
+_gs_client = None
+_ws_cache = None
+
+def _gs_authorize():
+    global _gs_client
+    if _gs_client:
+        return _gs_client
     google_creds = os.getenv("GOOGLE_CREDS")
-    if not google_creds or not SHEET_ID:
-        raise RuntimeError("Set GOOGLE_CREDS and SHEET_ID env vars in Render.")
+    if not google_creds:
+        raise RuntimeError("Set GOOGLE_CREDS env var in Render.")
     scope = [
-        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
     creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(google_creds), scope)
-    client = gspread.authorize(creds)
+    _gs_client = gspread.authorize(creds)
+    return _gs_client
+
+def _sheet():
+    global _ws_cache
+    if _ws_cache:
+        return _ws_cache
+    client = _gs_authorize()
     sh = client.open_by_key(SHEET_ID)
     try:
         ws = sh.worksheet("Picks")
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title="Picks", rows=1000, cols=len(_HEADERS))
+        ws = sh.add_worksheet(title="Picks", rows=2000, cols=len(_HEADERS))
     # ensure header row
     existing = ws.row_values(1)
     if existing != _HEADERS:
         ws.update("A1", [_HEADERS])
+    _ws_cache = ws
     return ws
 
-# ---- open a worksheet from any spreadsheet (used by !totals)
+# open a worksheet from any spreadsheet (used by !totals)
 def _open_ws(sheet_id: str, tab_title: str):
-    google_creds = os.getenv("GOOGLE_CREDS")
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(google_creds), scope)
-    return gspread.authorize(creds).open_by_key(sheet_id).worksheet(tab_title)
+    client = _gs_authorize()
+    return client.open_by_key(sheet_id).worksheet(tab_title)
 
-def _get_main_guild(bot):
+# ---------- Guild & time helpers ----------
+async def _get_main_guild(bot: commands.Bot):
     global MAIN_GUILD_ID
     if MAIN_GUILD_ID:
         g = bot.get_guild(MAIN_GUILD_ID)
         if g:
             return g
-    ch = bot.get_channel(REVEAL_CHANNEL_ID)
-    if ch is None:
-        ch = bot.loop.run_until_complete(bot.fetch_channel(REVEAL_CHANNEL_ID))
+    ch = bot.get_channel(REVEAL_CHANNEL_ID) or await bot.fetch_channel(REVEAL_CHANNEL_ID)
     MAIN_GUILD_ID = ch.guild.id
     return ch.guild
 
@@ -81,8 +106,29 @@ def _fmt_time_12h(dt_utc: datetime) -> str:
     local = dt_utc.astimezone(EASTERN)
     return f"{local.strftime('%a %I:%M %p').lstrip('0')}"
 
+def _parse_iso(ts: str) -> datetime:
+    # tolerant ISO parser without adding new deps
+    if ts.endswith("Z"):
+        ts = ts[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(ts)
+    except Exception:
+        # very rare fallbacks still handled roughly
+        return datetime.now(timezone.utc)
+
+def _fmt_duration(seconds: int) -> str:
+    mins, secs = divmod(int(seconds), 60)
+    hrs, mins = divmod(mins, 60)
+    days, hrs = divmod(hrs, 24)
+    parts = []
+    if days: parts.append(f"{days}d")
+    if days or hrs: parts.append(f"{hrs}h")
+    if days or hrs or mins: parts.append(f"{mins}m")
+    parts.append(f"{secs}s")
+    return " ".join(parts)
+
 async def _announce_channel(bot: commands.Bot):
-    g = _get_main_guild(bot)
+    g = await _get_main_guild(bot)
     gen = discord.utils.get(g.text_channels, name="general")
     if gen:
         return gen
@@ -90,10 +136,16 @@ async def _announce_channel(bot: commands.Bot):
         return g.system_channel
     return bot.get_channel(REVEAL_CHANNEL_ID)
 
+def _ctx_guild(ctx) -> discord.Guild | None:
+    return getattr(ctx.channel, "guild", None)
+
 # ---------- data access ----------
 def save_pick_to_sheet(guild_id: int, user_id: int, name: str, pick: str, ts_utc_iso: str):
-    ws = _sheet()
-    ws.append_row([str(guild_id), str(user_id), name, pick, ts_utc_iso], value_input_option="RAW")
+    try:
+        ws = _sheet()
+        ws.append_row([str(guild_id), str(user_id), name, pick, ts_utc_iso], value_input_option="RAW")
+    except gspread.exceptions.APIError as e:
+        raise RuntimeError("Google Sheets quota or permission error") from e
 
 def load_latest_picks(guild_id: int):
     """Return dict keyed by user_id with latest pick only."""
@@ -105,13 +157,8 @@ def load_latest_picks(guild_id: int):
             continue
         uid = str(r.get("user_id"))
         ts = r.get("ts_utc") or ""
-        # keep the newest
         if uid not in latest or ts > latest[uid]["ts_utc"]:
-            latest[uid] = {
-                "name": r.get("name", ""),
-                "pick": r.get("pick", ""),
-                "ts_utc": ts,
-            }
+            latest[uid] = {"name": r.get("name", ""), "pick": r.get("pick", ""), "ts_utc": ts}
     return latest
 
 def clear_guild_picks(guild_id: int):
@@ -133,7 +180,10 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 # --- helper that posts and clears (used by scheduler & !revealnow)
 async def _do_auto_reveal():
     channel = bot.get_channel(REVEAL_CHANNEL_ID) or await bot.fetch_channel(REVEAL_CHANNEL_ID)
-    guild_id = channel.guild.id
+    guild = getattr(channel, "guild", None)
+    if not guild:
+        return False
+    guild_id = guild.id
 
     latest = load_latest_picks(guild_id)
     if not latest:
@@ -145,7 +195,7 @@ async def _do_auto_reveal():
 
     lines = ["**📣 This Week’s Picks:**"]
     for rec in latest.values():
-        ts = datetime.fromisoformat(rec["ts_utc"])
+        ts = _parse_iso(rec["ts_utc"])
         lines.append(f"- **{rec['name']}**: {rec['pick']} *(submitted {_fmt_time_12h(ts)} ET)*")
 
     try:
@@ -158,21 +208,46 @@ async def _do_auto_reveal():
 
 @bot.event
 async def on_ready():
-    g = _get_main_guild(bot)
+    g = await _get_main_guild(bot)
     print(f"✅ Logged in as {bot.user} | Main guild: {g.name} ({g.id})")
+    # quick self-test of Sheets header (non-fatal)
+    try:
+        _ = _sheet().row_values(1)
+    except Exception as e:
+        print("Sheets self-test failed:", type(e).__name__, e)
     if not auto_reveal_task.is_running():
         auto_reveal_task.start()
+
+@bot.event
+async def on_command_error(ctx, error):
+    from discord.ext.commands import CommandOnCooldown
+    if isinstance(error, CommandOnCooldown):
+        await ctx.send(f"⏳ Slow down: try again in {error.retry_after:.1f}s.")
+        return
+    await ctx.send(f"⚠️ Error: {type(error).__name__}")
 
 @bot.command()
 async def ping(ctx):
     await ctx.send("pong 🏌️")
 
 @bot.command()
+@cooldown(1, 10, BucketType.user)  # prevent spam/double-submits
 async def pick(ctx, *, golfer: str):
-    g = _get_main_guild(bot)
+    if not _ctx_guild(ctx):
+        await ctx.send("❌ Use this in a server channel.")
+        return
+    golfer = " ".join(golfer.split())
+    if not (1 <= len(golfer) <= 64):
+        await ctx.send("❌ Golfer name must be 1–64 characters.")
+        return
+    g = await _get_main_guild(bot)
     now_utc = datetime.now(timezone.utc)
-    save_pick_to_sheet(g.id, ctx.author.id, ctx.author.display_name, golfer.strip(), now_utc.isoformat())
-    await ctx.send(f"✅ Pick saved for **{golfer.strip()}**")
+    try:
+        save_pick_to_sheet(g.id, ctx.author.id, ctx.author.display_name, golfer, now_utc.isoformat())
+    except Exception as e:
+        await ctx.send(f"❌ Could not save pick ({type(e).__name__}). Try again.")
+        return
+    await ctx.send(f"✅ Pick saved for **{golfer}**")
     ch = await _announce_channel(bot)
     if ch and ch.permissions_for(ch.guild.me).send_messages:
         try:
@@ -182,14 +257,14 @@ async def pick(ctx, *, golfer: str):
 
 @bot.command()
 async def submits(ctx):
-    g = _get_main_guild(bot)
+    g = await _get_main_guild(bot)
     latest = load_latest_picks(g.id)
     if not latest:
         await ctx.send("📭 No picks submitted yet.")
         return
     lines = ["**🕒 Pick Submission Times**"]
     for rec in latest.values():
-        ts = datetime.fromisoformat(rec["ts_utc"])
+        ts = _parse_iso(rec["ts_utc"])
         lines.append(f"- **{rec['name']}** at {_fmt_time_12h(ts)} ET")
     await ctx.send("\n".join(lines))
 
@@ -199,17 +274,17 @@ async def totals(ctx):
     tab = os.getenv("TOTALS_TAB", "Sheet1")
     try:
         ws = _open_ws(sid, tab)
+        # batch cells to reduce round-trips
+        (leader,), (lead_by,), (hiatt,), (caden,), (bennett,) = ws.batch_get(["O2","O3","O6","O7","O8"])
     except gspread.SpreadsheetNotFound:
         await ctx.send("❌ Can't open totals spreadsheet.")
         return
     except gspread.WorksheetNotFound:
         await ctx.send(f"❌ Can't find tab `{tab}`.")
         return
-    hiatt   = ws.acell("O6").value
-    caden   = ws.acell("O7").value
-    bennett = ws.acell("O8").value
-    leader  = ws.acell("O2").value
-    lead_by = ws.acell("O3").value
+    except Exception as e:
+        await ctx.send(f"❌ Sheets error: {type(e).__name__}")
+        return
     msg = (
         f"**💰 Current Totals**\n"
         f"Hiatt — {hiatt}\n"
@@ -228,19 +303,26 @@ async def revealnow(ctx):
     ok = await _do_auto_reveal()
     await ctx.send("✅ Revealed and cleared." if ok else "⚠️ No picks were submitted.")
 
+# ---------- Scheduler with 'already ran' latch ----------
+_last_reveal_date = None
+
 @tasks.loop(minutes=1)
 async def auto_reveal_task():
+    global _last_reveal_date
     now = datetime.now(EASTERN)
+    # Wednesday 21:00 ET; fire once per date
     if now.strftime("%A") == "Wednesday" and now.strftime("%H:%M") == "21:00":
+        if _last_reveal_date == now.date():
+            return
         try:
-            await _do_auto_reveal()
+            ok = await _do_auto_reveal()
+            print(f"[auto_reveal] {now.isoformat()} -> {'posted' if ok else 'no picks'}")
         except Exception as e:
             print("Auto reveal failed:", type(e).__name__, e)
+        finally:
+            _last_reveal_date = now.date()
 
-# ---------- !allocate command ----------
-import re
-from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
-
+# ---------- Odds allocation command ----------
 def frac_to_decimal(frac_str: str) -> Decimal:
     m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)\s*", frac_str)
     if not m:
@@ -304,6 +386,67 @@ async def allocate(ctx):
     except Exception as e:
         await ctx.reply(f"Error: {e}")
 
+# ---------- New: uptime & health ----------
+@bot.command()
+async def uptime(ctx):
+    now = datetime.now(timezone.utc)
+    delta = (now - START_TIME_UTC).total_seconds()
+    start_local = START_TIME_UTC.astimezone(EASTERN)
+    await ctx.send(
+        f"⏱️ Uptime: **{_fmt_duration(delta)}**\n"
+        f"Started: {start_local.strftime('%a %b %d, %I:%M %p').lstrip('0')} ET"
+    )
+
+@bot.command()
+async def health(ctx):
+    # Discord latency
+    latency_ms = int(bot.latency * 1000) if bot.latency is not None else -1
+
+    # Reveal channel & perms
+    try:
+        ch = bot.get_channel(REVEAL_CHANNEL_ID) or await bot.fetch_channel(REVEAL_CHANNEL_ID)
+        guild_ok = ch is not None and hasattr(ch, "guild") and ch.guild is not None
+        can_send = ch.permissions_for(ch.guild.me).send_messages if guild_ok else False
+        reveal_status = "✅" if guild_ok and can_send else "⚠️" if guild_ok else "❌"
+    except discord.Forbidden:
+        ch = None
+        reveal_status = "❌"
+        can_send = False
+
+    # Google Sheets
+    sheets_ok = False
+    picks_header_ok = False
+    sheets_msg = ""
+    try:
+        ws = _sheet()
+        sheets_ok = True
+        try:
+            header = ws.row_values(1)
+            picks_header_ok = (header == _HEADERS)
+        except Exception as e:
+            sheets_msg = f"Header read error: {type(e).__name__}"
+    except Exception as e:
+        sheets_msg = f"{type(e).__name__}: {e}"
+
+    # Scheduler
+    scheduler_running = auto_reveal_task.is_running()
+
+    lines = [
+        "**🩺 Bot Health Check**",
+        f"- Discord latency: **{latency_ms} ms**",
+        f"- Reveal channel ({REVEAL_CHANNEL_ID}): {reveal_status}"
+            + (" (cannot send)" if ch and not can_send else "")
+            + ("" if ch else " (not found)"),
+        f"- Sheets connection: {'✅' if sheets_ok else '❌'}",
+        f"- Picks header row: {'✅' if picks_header_ok else '❌'}",
+        f"- Scheduler running: {'✅' if scheduler_running else '❌'}",
+    ]
+    if sheets_msg:
+        lines.append(f"- Sheets note: `{sheets_msg}`")
+
+    await ctx.send("\n".join(lines))
+
+# ---------- Entrypoint ----------
 if __name__ == "__main__":
     keep_alive()
     bot.run(TOKEN)
