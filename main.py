@@ -86,7 +86,7 @@ def _sheet():
     _ws_cache = ws
     return ws
 
-# open a worksheet from any spreadsheet (used by !totals)
+# open a worksheet from any spreadsheet, used by !totals
 def _open_ws(sheet_id: str, tab_title: str):
     client = _gs_authorize()
     return client.open_by_key(sheet_id).worksheet(tab_title)
@@ -113,7 +113,6 @@ def _parse_iso(ts: str) -> datetime:
     try:
         return datetime.fromisoformat(ts)
     except Exception:
-        # very rare fallbacks still handled roughly
         return datetime.now(timezone.utc)
 
 def _fmt_duration(seconds: int) -> str:
@@ -177,7 +176,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
-# --- helper that posts and clears (used by scheduler & !revealnow)
+# --- helper that posts and clears, used by scheduler and !revealnow
 async def _do_auto_reveal():
     channel = bot.get_channel(REVEAL_CHANNEL_ID) or await bot.fetch_channel(REVEAL_CHANNEL_ID)
     guild = getattr(channel, "guild", None)
@@ -210,7 +209,7 @@ async def _do_auto_reveal():
 async def on_ready():
     g = await _get_main_guild(bot)
     print(f"✅ Logged in as {bot.user} | Main guild: {g.name} ({g.id})")
-    # quick self-test of Sheets header (non-fatal)
+    # quick self-test of Sheets header, non-fatal
     try:
         _ = _sheet().row_values(1)
     except Exception as e:
@@ -231,15 +230,14 @@ async def ping(ctx):
     await ctx.send("pong 🏌️")
 
 @bot.command()
-@cooldown(1, 10, BucketType.user)  # prevent spam/double-submits
+@cooldown(1, 10, BucketType.user)  # prevent spam and double-submits
 async def pick(ctx, *, golfer: str):
-    if not _ctx_guild(ctx):
-        await ctx.send("❌ Use this in a server channel.")
-        return
+    # Allow in DMs and in servers, always persist to the main guild
     golfer = " ".join(golfer.split())
     if not (1 <= len(golfer) <= 64):
         await ctx.send("❌ Golfer name must be 1–64 characters.")
         return
+
     g = await _get_main_guild(bot)
     now_utc = datetime.now(timezone.utc)
     try:
@@ -247,7 +245,10 @@ async def pick(ctx, *, golfer: str):
     except Exception as e:
         await ctx.send(f"❌ Could not save pick ({type(e).__name__}). Try again.")
         return
+
     await ctx.send(f"✅ Pick saved for **{golfer}**")
+
+    # Optional server announcement
     ch = await _announce_channel(bot)
     if ch and ch.permissions_for(ch.guild.me).send_messages:
         try:
@@ -310,7 +311,7 @@ _last_reveal_date = None
 async def auto_reveal_task():
     global _last_reveal_date
     now = datetime.now(EASTERN)
-    # Wednesday 21:00 ET; fire once per date
+    # Wednesday 21:00 ET, fire once per date
     if now.strftime("%A") == "Wednesday" and now.strftime("%H:%M") == "21:00":
         if _last_reveal_date == now.date():
             return
@@ -402,7 +403,7 @@ async def health(ctx):
     # Discord latency
     latency_ms = int(bot.latency * 1000) if bot.latency is not None else -1
 
-    # Reveal channel & perms
+    # Reveal channel and perms
     try:
         ch = bot.get_channel(REVEAL_CHANNEL_ID) or await bot.fetch_channel(REVEAL_CHANNEL_ID)
         guild_ok = ch is not None and hasattr(ch, "guild") and ch.guild is not None
